@@ -4,8 +4,9 @@ from typing import cast, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+from torch.distributed.tensor import DTensor, Shard
 
-from .optimizer import (
+from torch.optim.optimizer import (
     _capturable_doc,
     _default_to_fused_or_foreach,
     _device_dtype_check_for_fused,
@@ -26,10 +27,10 @@ from .optimizer import (
 )
 
 
-__all__ = ["AdamW", "adamw"]
+__all__ = ["CustomAdamW", "adamw"]
 
 
-class AdamW(Optimizer):
+class CustomAdamW(Optimizer):
     def __init__(
         self,
         params: ParamsT,
@@ -44,6 +45,7 @@ class AdamW(Optimizer):
         capturable: bool = False,
         differentiable: bool = False,
         fused: Optional[bool] = None,
+        device_mesh: Optional[torch.distributed.DeviceMesh] = None,
     ):
         if isinstance(lr, Tensor):
             if foreach and not capturable:
@@ -75,6 +77,12 @@ class AdamW(Optimizer):
             fused=fused,
         )
         super().__init__(params, defaults)
+        if device_mesh is not None:
+            assert device_mesh.ndim == 2, f"{device_mesh}"
+            # Assume (dp_replicate, dp_shard) for now
+        self.device_mesh = device_mesh
+        if torch.distributed.get_rank() == 0:
+            print(f"CustomAdamW: {device_mesh=}")
 
         if fused:
             if differentiable:
@@ -124,7 +132,7 @@ class AdamW(Optimizer):
             has_complex |= torch.is_complex(p)
             params_with_grad.append(p)
             if p.grad.is_sparse:
-                raise RuntimeError("AdamW does not support sparse gradients")
+                raise RuntimeError("CustomAdamW does not support sparse gradients")
             grads.append(p.grad)
 
             state = self.state[p]
@@ -159,6 +167,7 @@ class AdamW(Optimizer):
                     )
 
             exp_avgs.append(state["exp_avg"])
+            assert exp_avgs[-1] is not None
             exp_avg_sqs.append(state["exp_avg_sq"])
 
             if group["amsgrad"]:
@@ -206,6 +215,98 @@ class AdamW(Optimizer):
             amsgrad: bool = group["amsgrad"]
             beta1, beta2 = cast(Tuple[float, float], group["betas"])
 
+            if self.device_mesh is not None:
+                with torch.no_grad():
+                    sharded_tensors = []
+                    sharded_sizes = []
+                    sharded_numels = []
+                    for param in group["params"]:
+                        state = self.state[param]
+                        if "exp_avg" not in state:
+                            assert "exp_avg_sq" not in state
+                            continue  # skip 1st step
+                        assert "exp_avg_shard" in state
+
+                        # Naive logic:
+                        # state["exp_avg"] = state["exp_avg_shard"].redistribute(
+                        #     placements=(Replicate(), Shard(0))
+                        # )
+                        # state["exp_avg_sq"] = state["exp_avg_sq_shard"].redistribute(
+                        #     placements=(Replicate(), Shard(0))
+                        # )
+
+                        exp_avg_shard = state["exp_avg_shard"]._local_tensor
+                        exp_avg_sq_shard = state["exp_avg_sq_shard"]._local_tensor
+                        sharded_tensors.extend((exp_avg_shard, exp_avg_sq_shard))
+                        sharded_sizes.extend(
+                            (exp_avg_shard.size(), exp_avg_sq_shard.size())
+                        )
+                        sharded_numels.extend(
+                            (exp_avg_shard.numel(), exp_avg_sq_shard.numel())
+                        )
+
+                        state["exp_avg_shard"] = None
+                        state["exp_avg_sq_shard"] = None
+
+                    if sharded_tensors:
+                        # Assume even divisibility otherwise need to pad
+                        replicate_group = self.device_mesh.get_group("dp_replicate")
+                        replicate_group_size = replicate_group.size()
+                        all_gather_input_numel = sum(sharded_numels)
+                        all_gather_output_numel = (
+                            all_gather_input_numel * replicate_group_size
+                        )
+                        all_gather_output = sharded_tensors[0].new_empty(
+                            (all_gather_output_numel,)
+                        )
+                        all_gather_input = all_gather_output.narrow(
+                            0,
+                            all_gather_input_numel * replicate_group.rank(),
+                            all_gather_input_numel,
+                        )
+                        torch.cat(
+                            [t.view(-1) for t in sharded_tensors],
+                            dim=0,
+                            out=all_gather_input,
+                        )
+                        torch.distributed.all_gather_into_tensor(
+                            all_gather_output, all_gather_input, group=replicate_group
+                        )
+                        splits = [
+                            all_gather_output.new_empty((replicate_group_size, n))
+                            for n in sharded_numels
+                        ]
+                        torch.split_with_sizes_copy(
+                            all_gather_output.view(replicate_group_size, -1),
+                            sharded_numels,
+                            dim=1,
+                            out=splits,
+                        )
+                        for i, param in enumerate(group["params"]):
+                            state = self.state[param]
+                            exp_avg_unsharded_size = list(sharded_sizes[2 * i])
+                            exp_avg_unsharded_size[0] *= replicate_group_size
+                            exp_avg = splits[2 * i].view(exp_avg_unsharded_size)
+                            exp_avg_sq_unsharded_size = list(sharded_sizes[2 * i + 1])
+                            exp_avg_sq_unsharded_size[0] *= replicate_group_size
+                            exp_avg_sq = splits[2 * i + 1].view(
+                                exp_avg_sq_unsharded_size
+                            )
+                            state["exp_avg"] = DTensor.from_local(
+                                exp_avg,
+                                param.device_mesh,
+                                param.placements,
+                                shape=param.shape,
+                                stride=param.stride(),
+                            )
+                            state["exp_avg_sq"] = DTensor.from_local(
+                                exp_avg_sq,
+                                param.device_mesh,
+                                param.placements,
+                                shape=param.shape,
+                                stride=param.stride(),
+                            )
+
             has_complex = self._init_group(
                 group,
                 params_with_grad,
@@ -240,10 +341,63 @@ class AdamW(Optimizer):
                 has_complex=has_complex,
             )
 
+            if self.device_mesh is not None:
+                replicate_group = self.device_mesh.get_group("dp_replicate")
+                replicate_group_size = replicate_group.size()
+                replicate_group_rank = replicate_group.rank()
+                src_tensors = []
+                tgt_tensors = []
+                with torch.no_grad():
+                    for param in group["params"]:
+                        state = self.state[param]
+
+                        exp_avg_unsharded_size = state["exp_avg"]._local_tensor.shape
+                        exp_avg_sq_unsharded_size = state[
+                            "exp_avg_sq"
+                        ]._local_tensor.shape
+                        exp_avg_sharded_size = list(exp_avg_unsharded_size)
+                        exp_avg_sharded_size[0] //= replicate_group_size
+                        exp_avg_sq_sharded_size = list(exp_avg_sq_unsharded_size)
+                        exp_avg_sq_sharded_size[0] //= replicate_group_size
+
+                        src_exp_avg_shard = state["exp_avg"]._local_tensor.narrow(
+                            0,
+                            exp_avg_sharded_size[0] * replicate_group_rank,
+                            exp_avg_sharded_size[0],
+                        )
+                        tgt_exp_avg_shard = torch.empty_like(src_exp_avg_shard)
+
+                        src_exp_avg_sq_shard = state["exp_avg_sq"]._local_tensor.narrow(
+                            0,
+                            exp_avg_sq_sharded_size[0] * replicate_group_rank,
+                            exp_avg_sq_sharded_size[0],
+                        )
+                        tgt_exp_avg_sq_shard = torch.empty_like(src_exp_avg_sq_shard)
+                        src_tensors.extend((src_exp_avg_shard, src_exp_avg_sq_shard))
+                        tgt_tensors.extend((tgt_exp_avg_shard, tgt_exp_avg_sq_shard))
+
+                        state["exp_avg_shard"] = DTensor.from_local(
+                            tgt_exp_avg_shard,
+                            param.device_mesh,
+                            (Shard(0), Shard(0)),
+                            shape=param.shape,
+                            stride=param.stride(),
+                        )
+                        state["exp_avg_sq_shard"] = DTensor.from_local(
+                            tgt_exp_avg_sq_shard,
+                            param.device_mesh,
+                            (Shard(0), Shard(0)),
+                            shape=param.shape,
+                            stride=param.stride(),
+                        )
+                        state["exp_avg"] = None
+                        state["exp_avg_sq"] = None
+                    torch._foreach_copy_(tgt_tensors, src_tensors)
+
         return loss
 
 
-AdamW.__doc__ = (
+CustomAdamW.__doc__ = (
     r"""Implements AdamW algorithm.
 
     .. math::

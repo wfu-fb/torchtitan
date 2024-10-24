@@ -12,7 +12,7 @@ from torchtitan.config_manager import JobConfig
 
 
 # consider split between PP and non-PP
-def build_optimizers(model_parts, job_config: JobConfig):
+def build_optimizers(model_parts, job_config: JobConfig, world_mesh: torch.distributed.DeviceMesh):
     """Wrap one optimizer per model part in an OptimizersContainer which provides a single
     step() and zero_grad() method for all the child optimizers.
     """
@@ -35,6 +35,10 @@ def build_optimizers(model_parts, job_config: JobConfig):
             optimizer = torch.optim.Adam(model.parameters(), **optimizer_kwargs)
         elif name == "AdamW":
             optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+        elif name == "CustomAdamW":
+            from torchtitan.optim.custom_adamw import CustomAdamW
+            optimizer_kwargs["device_mesh"] = world_mesh
+            optimizer = CustomAdamW(model.parameters(), **optimizer_kwargs)
         else:
             raise NotImplementedError(f"Optimizer {name} not added.")
 

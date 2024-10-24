@@ -135,7 +135,8 @@ def main(job_config: JobConfig):
             pred.flatten(0, 1).float(), labels.flatten(0, 1)
         )
 
-    if job_config.training.compile:
+    # if job_config.training.compile:
+    if True:
         loss_fn = torch.compile(loss_fn)
 
     # apply parallelisms and initialization
@@ -174,8 +175,12 @@ def main(job_config: JobConfig):
     )
 
     # build optimizer after applying parallelisms to the model
-    optimizers = build_optimizers(model_parts, job_config)
+    logger.info(f"{world_mesh=}")
+    optimizers = build_optimizers(model_parts, job_config, world_mesh)
     lr_schedulers = build_lr_schedulers(optimizers.optimizers, job_config)
+
+    # for param_name, param in model.named_parameters():
+    #     logger.info(f"{param_name}: {param.placements} {param.shape} {param._local_tensor.shape}")
 
     train_state = TrainState()
 
